@@ -1,234 +1,230 @@
 # %%
-import lovely_tensors as lt
+import json
+import urllib.request
+from datetime import datetime
+
 import matplotlib.pyplot as plt
 import numpy as np
+import polars as pl
 import torch
+from datasets import load_dataset
 from dotenv import load_dotenv
-from einops import rearrange
-from sentence_transformers import SentenceTransformer
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-lt.monkey_patch()
+from noveltybench import compute_metrics, plot_metrics
+
 load_dotenv()
 
-# %%
-model_name = "google/gemma-3-4b-it"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+# %% Configuration
+MODEL_NAME = "Qwen/Qwen3-4B-Instruct-2507"
+N = 8
+MAX_NEW_TOKENS = 512  # NoveltyBench paper default
+BATCH_SIZE = 32
+TEMPERATURES = [0.01, 0.4, 0.8, 1.2]
+T_RESPONSE_IFG = 0.6
+
+# %% Load NB-Curated (100 prompts: randomness, factual, creative, subjectivity)
+ds = load_dataset("yimingzhang/novelty-bench", split="curated")
+QUESTIONS = [row["prompt"] for row in ds]
+QUESTION_IDS = [row["id"] for row in ds]
+Q = len(QUESTIONS)
+print(f"Loaded {Q} prompts from NB-Curated")
+
+_HUMANS_URL = "https://raw.githubusercontent.com/novelty-bench/novelty-bench/main/data/humans.jsonl"
+with urllib.request.urlopen(_HUMANS_URL) as resp:
+    _human_data = {
+        row["id"]: row
+        for line in resp
+        if (row := json.loads(line))["id"] in set(QUESTION_IDS)
+    }
+
+_human_ids = [qid for qid in QUESTION_IDS if qid in _human_data]
+human_distinct_k = np.array([_human_data[qid]["distinct"] for qid in _human_ids])
+human_utility_k = np.array([_human_data[qid]["utility"] for qid in _human_ids])
+n_human = len(_human_ids)
+print(
+    f"Human baselines ({n_human} prompts, 8 annotators): "
+    f"distinct_k={human_distinct_k.mean():.2f}±{human_distinct_k.std() / np.sqrt(n_human):.2f}, "
+    f"utility_k={human_utility_k.mean():.2f}±{human_utility_k.std() / np.sqrt(n_human):.2f}"
+)
+
+# %% Load model
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(
-    model_name, dtype=torch.bfloat16, device_map="cuda:0"
+    MODEL_NAME, dtype=torch.bfloat16, device_map="cuda:0"
 )
 model.config.pad_token_id = tokenizer.pad_token_id
 
-emb_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-nli_model_name = "microsoft/deberta-large-mnli"
-nli_tokenizer = AutoTokenizer.from_pretrained(nli_model_name)
-nli_model = AutoModelForSequenceClassification.from_pretrained(nli_model_name).to(
-    "cuda:0"
-)
-nli_model.eval()
-
-# %%
-# Prompts modelled on NoveltyBench NB-Curated categories:
-#   - Randomness: many equally valid discrete answers
-#   - Factual knowledge: underspecified, many correct answers
-#   - Creative writing: open-ended generation
-#   - Subjectivity: opinion-based
-QUESTIONS = [
-    # Randomness
-    "Pick a random number between 1 and 100.",
-    "Name a random color.",
-    # Factual knowledge (underspecified → many valid answers)
-    "Name a capital city in Europe.",
-    "Name a species of bird.",
-    "Tell me a historical event from the 20th century.",
-    # Creative writing
-    "Tell me a very short fictional story in 2-3 sentences.",
-    "Give me an original metaphor for loneliness.",
-    "Write a riddle.",
-    # Subjectivity
-    "What is a fun hobby to pick up?",
-    "Recommend me an interesting place to travel to.",
-]
-
-N = 8  # responses per question — matches NoveltyBench's 8 human baselines
-
-
-# %%
-def generate_responses(questions, n, **kwargs):
-    prompts = [q for q in questions for _ in range(n)]
-
+# %% Generation helpers
+def _tokenize(prompts: list[str]):
     tokenizer.padding_side = "left"
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
-
-    with torch.no_grad():
-        output_ids = model.generate(**inputs, **kwargs)
-
-    generated = output_ids[:, inputs["input_ids"].shape[1] :]
-    return rearrange(generated, "(q n) s -> q n s", q=len(questions), n=n)
-
-
-def decode_responses(tokens_QNS):
-    Q, N, _ = tokens_QNS.shape
-    return [
-        [
-            tokenizer.decode(tokens_QNS[q, n], skip_special_tokens=True).strip()
-            for n in range(N)
-        ]
-        for q in range(Q)
+    chat_texts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        for p in prompts
     ]
+    return tokenizer(chat_texts, return_tensors="pt", padding=True).to(model.device)
 
 
-# %%
-def compute_embedding_diversity(tokens_QNS):
-    """Mean pairwise cosine distance among N responses, per question. Returns (Q,)."""
-    Q, N, _ = tokens_QNS.shape
-    texts = [t for q_texts in decode_responses(tokens_QNS) for t in q_texts]
-
-    embs = emb_model.encode(texts, convert_to_tensor=True)
-    embs = rearrange(embs, "(q n) d -> q n d", q=Q, n=N)
-    embs = torch.nn.functional.normalize(embs, p=2, dim=-1)
-
-    # (Q, N, N) pairwise cosine similarities
-    sims = torch.bmm(embs, embs.transpose(1, 2))
-
-    # mean over off-diagonal pairs → within-prompt diversity
-    mask = ~torch.eye(N, dtype=torch.bool).unsqueeze(0).expand(Q, -1, -1)
-    return (1.0 - sims)[mask].reshape(Q, N * (N - 1)).mean(dim=-1)
+@torch.no_grad()
+def generate_batched(prompts: list[str], **kwargs) -> list[str]:
+    """Generate one response per prompt, in BATCH_SIZE chunks. Returns decoded text."""
+    results = []
+    for i in range(0, len(prompts), BATCH_SIZE):
+        batch = prompts[i : i + BATCH_SIZE]
+        inputs = _tokenize(batch)
+        output_ids = model.generate(**inputs, **kwargs)
+        generated = output_ids[:, inputs["input_ids"].shape[1] :]
+        results.extend(
+            tokenizer.decode(generated[j], skip_special_tokens=True).strip()
+            for j in range(generated.shape[0])
+        )
+    return results
 
 
-# %%
-def _bidirectional_entailment(text_a: str, text_b: str) -> bool:
-    """True if a entails b AND b entails a (DeBERTa-large-mnli label 2 = entailment)."""
-    for premise, hypothesis in [(text_a, text_b), (text_b, text_a)]:
-        inputs = nli_tokenizer(
-            premise, hypothesis, return_tensors="pt", truncation=True, max_length=512
-        ).to(nli_model.device)
-        with torch.no_grad():
-            pred = nli_model(**inputs).logits.argmax(dim=-1).item()
-        if pred != 2:
-            return False
-    return True
+def generate_responses(questions: list[str], n: int, **kwargs) -> list[list[str]]:
+    """Generate n responses per question. Returns Q × N list of decoded strings."""
+    flat = generate_batched([q for q in questions for _ in range(n)], **kwargs)
+    return [flat[q * n : (q + 1) * n] for q in range(len(questions))]
 
 
-def compute_semantic_diversity(tokens_QNS):
-    """NLI-based distinct semantic classes among N responses, per question.
+# %% IFG (Intent Factored Generation) — Ahmed et al., 2025
+INTENT_INSTRUCTION = (
+    "Below is a prompt. Produce a brief direction for a response — "
+    "just 3-5 keywords or a single concept sentence. "
+    "Output ONLY the direction, nothing else.\n\n"
+    "Prompt: {question}\n\nDirection:"
+)
 
-    Following Kuhn et al. (Nature 2024) / NoveltyBench:
-      1. For each question, greedily cluster N responses via bidirectional entailment.
-      2. Return the number of distinct clusters (= "distinct_k") per question.
-
-    This counts *within-prompt* semantic equivalence classes — exactly what
-    NoveltyBench measures. Higher = more semantically diverse.
-
-    Returns (Q,) tensor of floats (number of distinct clusters per question).
-    """
-    responses = decode_responses(tokens_QNS)
-    Q = len(responses)
-    distinct = []
-
-    for q in range(Q):
-        # Greedy clustering: assign each response to first matching cluster
-        # or create a new one. O(N * num_clusters) NLI calls per question.
-        representatives: list[int] = []  # index of cluster representative
-        for i in range(len(responses[q])):
-            matched = False
-            for rep in representatives:
-                if _bidirectional_entailment(responses[q][i], responses[q][rep]):
-                    matched = True
-                    break
-            if not matched:
-                representatives.append(i)
-        distinct.append(float(len(representatives)))
-
-    return torch.tensor(distinct)
+IFG_RESPONSE_TEMPLATE = "{question}\n\n[Follow this direction: {intent}]"
 
 
-# %%
-temperatures = np.linspace(0.01, 1.0, 12)
-results = {
-    "emb_mean": [],
-    "emb_sem": [],
-    "nli_mean": [],
-    "nli_sem": [],
-}
-
-Q = len(QUESTIONS)
-
-for temp in temperatures:
-    print(f"temp={temp:.2f} ... ", end="", flush=True)
-    tokens = generate_responses(
-        QUESTIONS, n=N, max_new_tokens=128, do_sample=True, temperature=float(temp)
+def generate_intents(questions: list[str], n: int, **kwargs) -> list[list[str]]:
+    """IFG Stage 1: sample N intent strings per question."""
+    flat = generate_batched(
+        [INTENT_INSTRUCTION.format(question=q) for q in questions for _ in range(n)],
+        max_new_tokens=48,
+        **kwargs,
     )
+    return [flat[q * n : (q + 1) * n] for q in range(len(questions))]
 
-    # Embedding diversity: (Q,) → mean ± SEM across questions
-    emb_Q = compute_embedding_diversity(tokens)
-    results["emb_mean"].append(emb_Q.mean().item())
-    results["emb_sem"].append(emb_Q.std().item() / np.sqrt(Q))
 
-    # NLI diversity: (Q,) → mean ± SEM across questions
-    nli_Q = compute_semantic_diversity(tokens)
-    results["nli_mean"].append(nli_Q.mean().item())
-    results["nli_sem"].append(nli_Q.std().item() / np.sqrt(Q))
-
-    print(
-        f"emb={results['emb_mean'][-1]:.4f}±{results['emb_sem'][-1]:.4f}  "
-        f"distinct={results['nli_mean'][-1]:.2f}±{results['nli_sem'][-1]:.2f}/{N}"
+def generate_from_intents(
+    questions: list[str], intents: list[list[str]], **kwargs
+) -> list[list[str]]:
+    """IFG Stage 2: generate responses conditioned on (question, intent) pairs."""
+    Q, N_i = len(questions), len(intents[0])
+    flat = generate_batched(
+        [
+            IFG_RESPONSE_TEMPLATE.format(question=questions[q], intent=intents[q][n])
+            for q in range(Q)
+            for n in range(N_i)
+        ],
+        **kwargs,
     )
+    return [flat[q * N_i : (q + 1) * N_i] for q in range(Q)]
 
-for k in results:
-    results[k] = np.array(results[k])
+
+# %% Run experiments
+results_rows: list[dict] = []
+
+
+def _run_and_record(method: str, temperature: float, responses: list[list[str]]):
+    nb = compute_metrics(QUESTIONS, responses, device="cuda:0")
+    for q_idx in range(Q):
+        results_rows.append(
+            {
+                "method": method,
+                "temperature": temperature,
+                "prompt_id": QUESTION_IDS[q_idx],
+                "distinct_k": nb["distinct_k"][q_idx].item(),
+                "utility_k": nb["utility_k"][q_idx].item(),
+                "class_quality_mean": nb["class_quality_mean"][q_idx].item(),
+            }
+        )
+    dk = nb["distinct_k"].mean().item()
+    uk = nb["utility_k"].mean().item()
+    print(f"distinct_k={dk:.2f}/{N}  utility_k={uk:.2f}")
+
+
+for temp in TEMPERATURES:
+    print(f"Baseline temp={temp:.2f} ... ", end="", flush=True)
+    responses = generate_responses(
+        QUESTIONS,
+        N,
+        max_new_tokens=MAX_NEW_TOKENS,
+        do_sample=True,
+        temperature=float(temp),
+    )
+    _run_and_record("baseline", float(temp), responses)
 
 # %%
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+for t_i in TEMPERATURES:
+    print(f"IFG t_intent={t_i:.2f}, t_resp={T_RESPONSE_IFG} ... ", end="", flush=True)
+    intents = generate_intents(QUESTIONS, N, do_sample=True, temperature=float(t_i))
+    responses = generate_from_intents(
+        QUESTIONS,
+        intents,
+        max_new_tokens=MAX_NEW_TOKENS,
+        do_sample=True,
+        temperature=T_RESPONSE_IFG,
+    )
+    _run_and_record(f"ifg_t_resp={T_RESPONSE_IFG}", float(t_i), responses)
 
-# Left panel: embedding cosine distance
-ax1.plot(temperatures, results["emb_mean"], "o-", color="#4C72B0", ms=5, lw=1.5)
-ax1.fill_between(
-    temperatures,
-    results["emb_mean"] - results["emb_sem"],
-    results["emb_mean"] + results["emb_sem"],
-    alpha=0.2,
-    color="#4C72B0",
-)
-ax1.set_xlabel("Temperature")
-ax1.set_ylabel("Mean pairwise cosine distance")
-ax1.set_title("Embedding diversity (SBERT)")
-ax1.set_xlim(0, 1.05)
-ax1.spines[["top", "right"]].set_visible(False)
+# %% Save results to timestamped CSV
+df = pl.DataFrame(results_rows)
+csv_path = f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+df.write_csv(csv_path)
+print(f"Saved {len(df)} rows to {csv_path}")
+print(df)
 
-# Right panel: NLI distinct clusters
-ax2.plot(temperatures, results["nli_mean"], "s-", color="#DD8452", ms=5, lw=1.5)
-ax2.fill_between(
-    temperatures,
-    results["nli_mean"] - results["nli_sem"],
-    results["nli_mean"] + results["nli_sem"],
-    alpha=0.2,
-    color="#DD8452",
-)
-ax2.set_xlabel("Temperature")
-ax2.set_ylabel(f"Distinct semantic classes (out of {N})")
-ax2.set_title("Semantic diversity (NLI clustering)")
-ax2.set_xlim(0, 1.05)
-ax2.set_ylim(0, N + 0.5)
-ax2.axhline(N, color="gray", ls="--", lw=0.8, label=f"max = {N}")
-ax2.legend(frameon=False)
-ax2.spines[["top", "right"]].set_visible(False)
 
-fig.suptitle(
-    f"{model_name}  ·  N={N} responses/prompt  ·  {Q} prompts  ·  ±1 SEM",
-    fontsize=11,
-    y=1.02,
+# %% Plot
+def _summarize_for_plot(df: pl.DataFrame, method: str) -> dict:
+    s = (
+        df.filter(pl.col("method") == method)
+        .group_by("temperature")
+        .agg(
+            pl.col("distinct_k").mean().alias("distinct_k_mean"),
+            (pl.col("distinct_k").std() / pl.col("distinct_k").count().sqrt()).alias(
+                "distinct_k_sem"
+            ),
+            pl.col("utility_k").mean().alias("utility_k_mean"),
+            (pl.col("utility_k").std() / pl.col("utility_k").count().sqrt()).alias(
+                "utility_k_sem"
+            ),
+        )
+        .sort("temperature")
+    )
+    return {
+        "x": s["temperature"].to_numpy(),
+        "distinct_k_mean": s["distinct_k_mean"].to_numpy(),
+        "distinct_k_sem": s["distinct_k_sem"].to_numpy(),
+        "utility_k_mean": s["utility_k_mean"].to_numpy(),
+        "utility_k_sem": s["utility_k_sem"].to_numpy(),
+    }
+
+
+ifg_method = f"ifg_t_resp={T_RESPONSE_IFG}"
+fig = plot_metrics(
+    {
+        "Baseline": _summarize_for_plot(df, "baseline"),
+        f"IFG ($t_{{resp}}={T_RESPONSE_IFG}$)": _summarize_for_plot(df, ifg_method),
+    },
+    n=N,
+    human_distinct_k=float(human_distinct_k.mean()),
+    human_utility_k=float(human_utility_k.mean()),
+    xlabel="Temperature",
+    title=f"{MODEL_NAME}  ·  N={N}  ·  {Q} NB-Curated prompts  ·  ±1 SEM",
+    save_path="diversity_vs_temperature.png",
 )
-fig.tight_layout()
-fig.savefig("diversity_vs_temperature.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("Saved diversity_vs_temperature.png")
 
 # %%
