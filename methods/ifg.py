@@ -73,10 +73,10 @@ def generate(
 
     Returns (results_df, metadata).
     """
-    assert temperature_intent >= temperature_response, (
-        f"IFG expects temperature_intent >= temperature_response, "
-        f"got {temperature_intent} < {temperature_response}"
-    )
+    # assert temperature_intent >= temperature_response, (
+    #     f"IFG expects temperature_intent >= temperature_response, "
+    #     f"got {temperature_intent} < {temperature_response}"
+    # )
 
     metadata = {
         "id": f"ifg_ti={temperature_intent}_tr={temperature_response}",

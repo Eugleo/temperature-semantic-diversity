@@ -49,12 +49,27 @@ EXPERIMENTS = [
     {**_COMMON, "name": "baseline", "temperature_response": 0.01},
     {**_COMMON, "name": "baseline", "temperature_response": 0.6},
     {**_COMMON, "name": "baseline", "temperature_response": 1.2},
+    {**_COMMON, "name": "ifg", "temperature_intent": 0.6, "temperature_response": 0.01},
+    {**_COMMON, "name": "ifg", "temperature_intent": 0.6, "temperature_response": 0.6},
+    {**_COMMON, "name": "ifg", "temperature_intent": 0.6, "temperature_response": 1.2},
+    {**_COMMON, "name": "regeneration", "temperature_response": 0.01},
+    {**_COMMON, "name": "regeneration", "temperature_response": 0.6},
+    {**_COMMON, "name": "regeneration", "temperature_response": 1.2},
+    {**_COMMON, "name": "steering", "temperature_response": 0.01, "layer": 12},
+    {**_COMMON, "name": "steering", "temperature_response": 0.6, "layer": 12},
+    {**_COMMON, "name": "steering", "temperature_response": 1.2, "layer": 12},
 ]
 
 # %% Load NB-Curated (100 prompts: randomness, factual, creative, subjectivity)
 ds = load_dataset("yimingzhang/novelty-bench", split="curated")
 QUESTIONS = [row["prompt"] for row in ds]
 QUESTION_IDS = [row["id"] for row in ds]
+
+LIMIT = 3
+
+QUESTIONS = QUESTIONS[:LIMIT]
+QUESTION_IDS = QUESTION_IDS[:LIMIT]
+
 Q = len(QUESTIONS)
 print(f"Loaded {Q} prompts from NB-Curated")
 
@@ -163,19 +178,9 @@ for exp in EXPERIMENTS:
     label = DISPLAY_LABELS[meta["name"]]
     method_dfs.setdefault(label, []).append(_extract_metrics(results_df, meta))
 
-# %% Build per-method DataFrames and combined CSV
 methods_combined: dict[str, pl.DataFrame] = {
     name: pl.concat(dfs) for name, dfs in method_dfs.items()
 }
-
-all_df = pl.concat(
-    df.with_columns(pl.lit(name).alias("method"))
-    for name, df in methods_combined.items()
-)
-csv_path = f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-all_df.write_csv(csv_path)
-print(f"\nSaved {len(all_df)} rows to {csv_path}")
-print(all_df)
 
 # %% Plot
 fig = plot_metrics(
