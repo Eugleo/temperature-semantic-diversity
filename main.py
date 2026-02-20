@@ -47,14 +47,20 @@ _COMMON = {
 
 EXPERIMENTS = [
     {**_COMMON, "name": "baseline", "temperature_response": 0.01},
+    {**_COMMON, "name": "baseline", "temperature_response": 0.3},
     {**_COMMON, "name": "baseline", "temperature_response": 0.6},
+    {**_COMMON, "name": "baseline", "temperature_response": 0.9},
     {**_COMMON, "name": "baseline", "temperature_response": 1.2},
     {**_COMMON, "name": "ifg", "temperature_intent": 0.6, "temperature_response": 0.01},
+    {**_COMMON, "name": "ifg", "temperature_intent": 0.6, "temperature_response": 0.3},
     {**_COMMON, "name": "ifg", "temperature_intent": 0.6, "temperature_response": 0.6},
+    {**_COMMON, "name": "ifg", "temperature_intent": 0.6, "temperature_response": 0.9},
     {**_COMMON, "name": "ifg", "temperature_intent": 0.6, "temperature_response": 1.2},
-    {**_COMMON, "name": "regeneration", "temperature_response": 0.01},
-    {**_COMMON, "name": "regeneration", "temperature_response": 0.6},
-    {**_COMMON, "name": "regeneration", "temperature_response": 1.2},
+    {**_COMMON, "name": "regeneration", "temperature_response": 0.01, "batch_size": 32},
+    {**_COMMON, "name": "regeneration", "temperature_response": 0.3, "batch_size": 32},
+    {**_COMMON, "name": "regeneration", "temperature_response": 0.6, "batch_size": 32},
+    {**_COMMON, "name": "regeneration", "temperature_response": 0.9, "batch_size": 32},
+    {**_COMMON, "name": "regeneration", "temperature_response": 1.2, "batch_size": 32},
     {**_COMMON, "name": "steering", "temperature_response": 0.01, "layer": 12},
     {**_COMMON, "name": "steering", "temperature_response": 0.6, "layer": 12},
     {**_COMMON, "name": "steering", "temperature_response": 1.2, "layer": 12},
@@ -65,7 +71,7 @@ ds = load_dataset("yimingzhang/novelty-bench", split="curated")
 QUESTIONS = [row["prompt"] for row in ds]
 QUESTION_IDS = [row["id"] for row in ds]
 
-LIMIT = 3
+LIMIT = 100
 
 QUESTIONS = QUESTIONS[:LIMIT]
 QUESTION_IDS = QUESTION_IDS[:LIMIT]
@@ -134,7 +140,6 @@ def _run_experiment(exp: dict) -> tuple[pl.DataFrame, dict]:
         tokenizer,
         QUESTIONS,
         n_samples,
-        batch_size=BATCH_SIZE,
         results_dir=RESULTS_DIR,
         **exp,
     )

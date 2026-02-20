@@ -1,17 +1,19 @@
 """Steering-vector method: produce N diverse samples by applying N orthogonal
 random perturbations to a chosen residual-stream layer during prompt encoding.
 
-Uses nnsight-style activation patching via a forward hook on the target layer
-to steer only the prompt tokens.  Subsequent auto-regressive generation
-proceeds unmodified — the steered representations propagate through KV-cache.
+Uses nnsight to trace through the model and add a steering vector to the
+target layer's residual stream during the prompt-encoding pass only.
+Subsequent auto-regressive token generation proceeds unmodified — the steered
+representations propagate through KV-cache.
 """
 
 from __future__ import annotations
 
 import polars as pl
 import torch
+from nnsight import LanguageModel
 
-from utils import build_tidy_results, check_cache, tokenize_prompts
+from utils import build_tidy_results, check_cache
 
 
 def _orthogonal_vectors(n: int, d: int, device: torch.device) -> torch.Tensor:
@@ -87,41 +89,46 @@ def generate(
     vecs = _orthogonal_vectors(n_samples, d_model, device=model.device)
     vecs = (vecs * coefficient).to(model.dtype)  # (n_samples, d_model)
 
+    nn_model = LanguageModel(model, tokenizer=tokenizer)
+
     Q = len(prompts)
     responses: list[list[str]] = [[] for _ in range(Q)]
-    target_layer = model.model.layers[layer]
+
+    chat_texts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        for p in prompts
+    ]
+    prompt_token_lens = [len(tokenizer.encode(ct)) for ct in chat_texts]
 
     for sv_idx in range(n_samples):
         sv = vecs[sv_idx]  # (d_model,)
-        is_prompt_pass = [True]
 
-        def _hook(_mod, _inp, output, _sv=sv, _flag=is_prompt_pass):
-            """Add steering vector only on the first (prompt-encoding) pass."""
-            if _flag[0]:
-                _flag[0] = False
-                return (output[0] + _sv,) + output[1:]
+        for b_start in range(0, Q, batch_size):
+            b_texts = chat_texts[b_start : b_start + batch_size]
+            b_lens = prompt_token_lens[b_start : b_start + batch_size]
+            B = len(b_texts)
 
-        handle = target_layer.register_forward_hook(_hook)
-        try:
-            for b in range(0, Q, batch_size):
-                batch = prompts[b : b + batch_size]
-                inputs = tokenize_prompts(batch, tokenizer, model.device)
-                prompt_len = inputs["input_ids"].shape[1]
+            saved = []
+            with nn_model.generate(
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature_response,
+            ) as tracer:
+                for text in b_texts:
+                    with tracer.invoke(text):
+                        nn_model.model.layers[layer].output[:] += sv
+                        saved.append(nn_model.generator.output.save())
 
-                is_prompt_pass[0] = True
-                out_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=True,
-                    temperature=temperature_response,
-                )
-                gen = out_ids[:, prompt_len:]
-                for j in range(gen.shape[0]):
-                    responses[b + j].append(
-                        tokenizer.decode(gen[j], skip_special_tokens=True).strip()
-                    )
-        finally:
-            handle.remove()
+            for j in range(B):
+                toks = saved[j].squeeze()
+                gen_toks = toks[b_lens[j] :]
+                resp = tokenizer.decode(gen_toks, skip_special_tokens=True).strip()
+                responses[b_start + j].append(resp)
 
     print("done")
     return build_tidy_results(prompts, responses), metadata
