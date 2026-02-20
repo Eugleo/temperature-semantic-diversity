@@ -36,7 +36,7 @@ def generate(
     n_samples: int,
     *,
     model_name: str,
-    temperature: float,
+    temperature_response: float,
     layer: int,
     coefficient: float = 1.0,
     max_new_tokens: int = 512,
@@ -57,10 +57,11 @@ def generate(
     Returns (results_df, metadata).
     """
     metadata = {
+        "id": f"steering_l={layer}_c={coefficient}_t={temperature_response}",
         "name": "steering",
-        "model": model_name,
+        "model_name": model_name,
         "n_samples": n_samples,
-        "temperature": temperature,
+        "temperature_response": temperature_response,
         "layer": layer,
         "coefficient": coefficient,
         "max_new_tokens": max_new_tokens,
@@ -71,13 +72,13 @@ def generate(
         if cached is not None:
             print(
                 f"  [cached] steering  layer={layer} "
-                f"coeff={coefficient} temp={temperature}"
+                f"coeff={coefficient} t={temperature_response}"
             )
             return cached, metadata
 
     print(
         f"  Generating steering  layer={layer} coeff={coefficient} "
-        f"temp={temperature} ...",
+        f"t={temperature_response} ...",
         end=" ",
         flush=True,
     )
@@ -112,7 +113,7 @@ def generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=True,
-                    temperature=temperature,
+                    temperature=temperature_response,
                 )
                 gen = out_ids[:, prompt_len:]
                 for j in range(gen.shape[0]):

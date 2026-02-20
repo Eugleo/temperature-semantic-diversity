@@ -81,7 +81,7 @@ def generate(
     metadata = {
         "id": f"ifg_ti={temperature_intent}_tr={temperature_response}",
         "name": "ifg",
-        "model": model_name,
+        "model_name": model_name,
         "n_samples": n_samples,
         "temperature_intent": temperature_intent,
         "temperature_response": temperature_response,

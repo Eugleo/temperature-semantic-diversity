@@ -11,7 +11,7 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from methods import baseline, ifg, regeneration
+from methods import baseline, ifg, regeneration, steering
 from noveltybench import CATEGORY_GROUPS, plot_metrics, score_results
 from utils import save_results, seed_everything
 
@@ -21,11 +21,35 @@ seed_everything(42)
 # %% Configuration
 MODEL_NAME = "Qwen/Qwen3-4B-Instruct-2507"
 N = 8
-MAX_NEW_TOKENS = 512  # NoveltyBench paper default
+MAX_NEW_TOKENS = 64
 BATCH_SIZE = 128
-TEMPERATURES = [0.01, 0.4, 0.8, 1.2]
-T_RESPONSE_IFG = 0.9
 RESULTS_DIR = "results"
+
+METHOD_MODULES = {
+    "baseline": baseline,
+    "ifg": ifg,
+    "regeneration": regeneration,
+    "steering": steering,
+}
+
+DISPLAY_LABELS = {
+    "baseline": "Baseline",
+    "ifg": "IFG",
+    "regeneration": "Regeneration",
+    "steering": "Steering",
+}
+
+_COMMON = {
+    "model_name": MODEL_NAME,
+    "n_samples": N,
+    "max_new_tokens": MAX_NEW_TOKENS,
+}
+
+EXPERIMENTS = [
+    {**_COMMON, "name": "baseline", "temperature_response": 0.01},
+    {**_COMMON, "name": "baseline", "temperature_response": 0.6},
+    {**_COMMON, "name": "baseline", "temperature_response": 1.2},
+]
 
 # %% Load NB-Curated (100 prompts: randomness, factual, creative, subjectivity)
 ds = load_dataset("yimingzhang/novelty-bench", split="curated")
@@ -58,7 +82,6 @@ print(
     f"utility_k={human_utility_k.mean():.2f}±{human_utility_k.std() / np.sqrt(n_human):.2f}"
 )
 
-# Per-category human baselines for plotting
 _human_by_cat: dict[str, dict[str, list[float]]] = {}
 for qid in _human_ids:
     cat_group = CATEGORY_GROUPS[_curated_data[qid]["category"]]
@@ -84,7 +107,24 @@ model = AutoModelForCausalLM.from_pretrained(
 model.config.pad_token_id = tokenizer.pad_token_id
 
 
-# %% Generate, score, and cache each method configuration
+# %% Run experiments
+def _run_experiment(exp: dict) -> tuple[pl.DataFrame, dict]:
+    """Dispatch an experiment dict to the appropriate method module."""
+    exp = dict(exp)
+    name = exp.pop("name")
+    n_samples = exp.pop("n_samples")
+    module = METHOD_MODULES[name]
+    return module.generate(
+        model,
+        tokenizer,
+        QUESTIONS,
+        n_samples,
+        batch_size=BATCH_SIZE,
+        results_dir=RESULTS_DIR,
+        **exp,
+    )
+
+
 def _finalize(results_df: pl.DataFrame, meta: dict) -> pl.DataFrame:
     """Add category column, score, and cache.  No-op if already scored (cache hit)."""
     if "distinct_k" in results_df.columns:
@@ -102,60 +142,26 @@ def _finalize(results_df: pl.DataFrame, meta: dict) -> pl.DataFrame:
     return results_df
 
 
-def _extract_metrics(results_df: pl.DataFrame, temperature: float) -> pl.DataFrame:
+def _extract_metrics(results_df: pl.DataFrame, meta: dict) -> pl.DataFrame:
     """Extract per-prompt metrics from a scored tidy DataFrame."""
     return (
         results_df.unique("prompt_id", maintain_order=True)
         .select(
             "prompt_id", "category", "distinct_k", "utility_k", "class_quality_mean"
         )
-        .with_columns(pl.lit(temperature).alias("temperature"))
+        .with_columns(
+            pl.lit(meta["temperature_response"]).alias("temperature_response")
+        )
     )
 
 
-common = dict(
-    model_name=MODEL_NAME,
-    max_new_tokens=MAX_NEW_TOKENS,
-    batch_size=BATCH_SIZE,
-    results_dir=RESULTS_DIR,
-)
+method_dfs: dict[str, list[pl.DataFrame]] = {}
 
-method_dfs: dict[str, list[pl.DataFrame]] = {
-    "Baseline": [],
-    f"IFG ($t_{{resp}}={T_RESPONSE_IFG}$)": [],
-    "Regeneration": [],
-}
-
-print("\n--- Baseline ---")
-for temp in TEMPERATURES:
-    results_df, meta = baseline.generate(
-        model, tokenizer, QUESTIONS, N, temperature=float(temp), **common
-    )
+for exp in EXPERIMENTS:
+    results_df, meta = _run_experiment(exp)
     results_df = _finalize(results_df, meta)
-    method_dfs["Baseline"].append(_extract_metrics(results_df, float(temp)))
-
-print("\n--- IFG ---")
-ifg_label = f"IFG ($t_{{resp}}={T_RESPONSE_IFG}$)"
-for t_i in TEMPERATURES:
-    results_df, meta = ifg.generate(
-        model,
-        tokenizer,
-        QUESTIONS,
-        N,
-        temperature_intent=float(t_i),
-        temperature_response=T_RESPONSE_IFG,
-        **common,
-    )
-    results_df = _finalize(results_df, meta)
-    method_dfs[ifg_label].append(_extract_metrics(results_df, float(t_i)))
-
-print("\n--- Regeneration ---")
-for temp in TEMPERATURES:
-    results_df, meta = regeneration.generate(
-        model, tokenizer, QUESTIONS, N, temperature=float(temp), **common
-    )
-    results_df = _finalize(results_df, meta)
-    method_dfs["Regeneration"].append(_extract_metrics(results_df, float(temp)))
+    label = DISPLAY_LABELS[meta["name"]]
+    method_dfs.setdefault(label, []).append(_extract_metrics(results_df, meta))
 
 # %% Build per-method DataFrames and combined CSV
 methods_combined: dict[str, pl.DataFrame] = {

@@ -14,7 +14,7 @@ def generate(
     n_samples: int,
     *,
     model_name: str,
-    temperature: float,
+    temperature_response: float,
     max_new_tokens: int = 512,
     batch_size: int = 128,
     use_cache: bool = True,
@@ -25,21 +25,21 @@ def generate(
     Returns (results_df, metadata).
     """
     metadata = {
-        "id": f"baseline_t={temperature}",
+        "id": f"baseline_t={temperature_response}",
         "name": "baseline",
-        "model": model_name,
+        "model_name": model_name,
         "n_samples": n_samples,
-        "temperature_response": temperature,
+        "temperature_response": temperature_response,
         "max_new_tokens": max_new_tokens,
     }
 
     if use_cache:
         cached = check_cache(metadata, results_dir)
         if cached is not None:
-            print(f"  [cached] baseline  temp={temperature}")
+            print(f"  [cached] baseline  t={temperature_response}")
             return cached, metadata
 
-    print(f"  Generating baseline  temp={temperature} ...", end=" ", flush=True)
+    print(f"  Generating baseline  t={temperature_response} ...", end=" ", flush=True)
 
     flat_prompts = [q for q in prompts for _ in range(n_samples)]
     flat_responses = generate_batched(
@@ -49,7 +49,7 @@ def generate(
         batch_size,
         max_new_tokens=max_new_tokens,
         do_sample=True,
-        temperature=temperature,
+        temperature=temperature_response,
     )
     responses = [
         flat_responses[q * n_samples : (q + 1) * n_samples] for q in range(len(prompts))

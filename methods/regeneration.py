@@ -24,7 +24,7 @@ def generate(
     n_samples: int,
     *,
     model_name: str,
-    temperature: float,
+    temperature_response: float,
     max_new_tokens: int = 512,
     repetition_prompt: str = DEFAULT_REPETITION_PROMPT,
     batch_size: int = 128,
@@ -42,11 +42,11 @@ def generate(
     Returns (results_df, metadata).
     """
     metadata = {
-        "id": f"regeneration_t={temperature}",
+        "id": f"regeneration_t={temperature_response}",
         "name": "regeneration",
-        "model": model_name,
+        "model_name": model_name,
         "n_samples": n_samples,
-        "temperature_response": temperature,
+        "temperature_response": temperature_response,
         "max_new_tokens": max_new_tokens,
         "repetition_prompt": repetition_prompt,
     }
@@ -54,11 +54,11 @@ def generate(
     if use_cache:
         cached = check_cache(metadata, results_dir)
         if cached is not None:
-            print(f"  [cached] regeneration  temp={temperature}")
+            print(f"  [cached] regeneration  t={temperature_response}")
             return cached, metadata
 
     print(
-        f"  Generating regeneration  temp={temperature} ...",
+        f"  Generating regeneration  t={temperature_response} ...",
         end=" ",
         flush=True,
     )
@@ -77,7 +77,7 @@ def generate(
             batch_size,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=temperature,
+            temperature=temperature_response,
         )
 
         for q in range(Q):

@@ -545,9 +545,9 @@ def plot_metrics(
 
     Args:
         methods: ``{display_name: DataFrame}``.  Each DataFrame must contain
-            columns ``temperature``, ``category``, ``distinct_k``, and
-            ``utility_k``.  Raw fine-grained categories are mapped to the
-            four high-level groups via :data:`CATEGORY_GROUPS`.
+            columns ``temperature_response``, ``category``, ``distinct_k``,
+            and ``utility_k``.  Raw fine-grained categories are mapped to
+            the four high-level groups via :data:`CATEGORY_GROUPS`.
         n: Number of samples per prompt (controls the y-axis *max* line).
         human_baselines: Optional ``{category_group: {"distinct_k": v,
             "utility_k": v}}``.
@@ -574,7 +574,7 @@ def plot_metrics(
                 continue
 
             stats = (
-                cat_df.group_by("temperature")
+                cat_df.group_by("temperature_response")
                 .agg(
                     pl.col("utility_k").mean().alias("uk_mean"),
                     (
@@ -585,10 +585,10 @@ def plot_metrics(
                         pl.col("distinct_k").std() / pl.col("distinct_k").count().sqrt()
                     ).alias("dk_sem"),
                 )
-                .sort("temperature")
+                .sort("temperature_response")
             )
 
-            x = stats["temperature"].to_numpy()
+            x = stats["temperature_response"].to_numpy()
 
             ax_util = axes[row, 0]
             ax_div = axes[row, 1]
@@ -647,8 +647,8 @@ def plot_metrics(
             ax_util.set_title("utility_k  (diversity × quality)")
             ax_div.set_title(f"distinct_k  (diversity, max {n})")
         if row == n_cats - 1:
-            ax_util.set_xlabel("Temperature")
-            ax_div.set_xlabel("Temperature")
+            ax_util.set_xlabel("temperature_response")
+            ax_div.set_xlabel("temperature_response")
 
     if title:
         fig.suptitle(title, fontsize=11, y=1.01)
