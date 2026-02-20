@@ -30,6 +30,36 @@ def _orthogonal_vectors(n: int, d: int, device: torch.device) -> torch.Tensor:
     return vecs
 
 
+def _estimate_layer_norm(
+    nn_model: LanguageModel,
+    chat_texts: list[str],
+    layer: int,
+    batch_size: int,
+) -> float:
+    """Compute the mean per-token L2 norm at *layer* over all prompts.
+
+    Runs a single forward pass (no generation) per batch via nnsight trace.
+    """
+    total_norm = 0.0
+    total_tokens = 0
+
+    for b_start in range(0, len(chat_texts), batch_size):
+        batch = chat_texts[b_start : b_start + batch_size]
+
+        saved = []
+        with nn_model.trace() as tracer:
+            for text in batch:
+                with tracer.invoke(text):
+                    saved.append(nn_model.model.layers[layer].output.save())
+
+        for h in saved:
+            per_token = h.squeeze(0).float().norm(dim=-1)  # (seq_len,)
+            total_norm += per_token.sum().item()
+            total_tokens += per_token.numel()
+
+    return total_norm / total_tokens
+
+
 @torch.no_grad()
 def generate(
     model,
@@ -48,13 +78,16 @@ def generate(
 ) -> tuple[pl.DataFrame, dict]:
     """Generate N responses per prompt via orthogonal steering vectors.
 
-    Creates *n_samples* orthogonal random unit vectors, scales each by
-    *coefficient*, and adds the result to the residual stream at the
-    specified *layer* during the prompt-encoding forward pass only.
-    Token generation proceeds without further intervention — the steered
-    prompt representations are carried forward via KV-cache.  One
-    response is sampled per steering direction, yielding *n_samples*
-    diverse outputs per prompt.
+    Creates *n_samples* orthogonal random unit vectors, scales each to
+    match the average activation norm at the target *layer* (measured
+    over the input prompts), then multiplies by *coefficient*.  A
+    coefficient of 1.0 therefore means "perturb by one average-norm
+    unit"; 0.5 means half that, etc.
+
+    The scaled vector is added to the residual stream at *layer* during
+    the prompt-encoding forward pass only.  Token generation proceeds
+    without further intervention — the steered prompt representations
+    are carried forward via KV-cache.
 
     Returns (results_df, metadata).
     """
@@ -86,9 +119,9 @@ def generate(
     )
 
     d_model = model.config.hidden_size
-    vecs = _orthogonal_vectors(n_samples, d_model, device=model.device)
-    vecs = (vecs * coefficient).to(model.dtype)  # (n_samples, d_model)
+    vecs = _orthogonal_vectors(n_samples, d_model, device=model.device)  # unit norm
 
+    tokenizer.padding_side = "left"
     nn_model = LanguageModel(model, tokenizer=tokenizer)
 
     Q = len(prompts)
@@ -104,6 +137,11 @@ def generate(
         for p in prompts
     ]
     prompt_token_lens = [len(tokenizer.encode(ct)) for ct in chat_texts]
+
+    # Measure the typical representation norm at the target layer so that
+    # `coefficient` is expressed in units of "average activation norm".
+    avg_norm = _estimate_layer_norm(nn_model, chat_texts, layer, batch_size)
+    vecs = (vecs * avg_norm * coefficient).to(model.dtype)  # (n_samples, d_model)
 
     for sv_idx in range(n_samples):
         sv = vecs[sv_idx]  # (d_model,)
