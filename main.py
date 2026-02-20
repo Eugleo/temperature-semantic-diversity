@@ -11,17 +11,21 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from noveltybench import compute_metrics, plot_metrics
+from methods import baseline, ifg, regeneration
+from noveltybench import CATEGORY_GROUPS, plot_metrics, score_results
+from utils import save_results, seed_everything
 
 load_dotenv()
+seed_everything(42)
 
 # %% Configuration
 MODEL_NAME = "Qwen/Qwen3-4B-Instruct-2507"
 N = 8
 MAX_NEW_TOKENS = 512  # NoveltyBench paper default
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 TEMPERATURES = [0.01, 0.4, 0.8, 1.2]
-T_RESPONSE_IFG = 0.6
+T_RESPONSE_IFG = 0.9
+RESULTS_DIR = "results"
 
 # %% Load NB-Curated (100 prompts: randomness, factual, creative, subjectivity)
 ds = load_dataset("yimingzhang/novelty-bench", split="curated")
@@ -29,6 +33,12 @@ QUESTIONS = [row["prompt"] for row in ds]
 QUESTION_IDS = [row["id"] for row in ds]
 Q = len(QUESTIONS)
 print(f"Loaded {Q} prompts from NB-Curated")
+
+_CURATED_URL = "https://raw.githubusercontent.com/novelty-bench/novelty-bench/main/data/curated.jsonl"
+with urllib.request.urlopen(_CURATED_URL) as resp:
+    _curated_data = {row["id"]: row for line in resp if (row := json.loads(line))}
+
+QUESTION_CATEGORIES = [_curated_data[qid]["category"] for qid in QUESTION_IDS]
 
 _HUMANS_URL = "https://raw.githubusercontent.com/novelty-bench/novelty-bench/main/data/humans.jsonl"
 with urllib.request.urlopen(_HUMANS_URL) as resp:
@@ -48,6 +58,22 @@ print(
     f"utility_k={human_utility_k.mean():.2f}±{human_utility_k.std() / np.sqrt(n_human):.2f}"
 )
 
+# Per-category human baselines for plotting
+_human_by_cat: dict[str, dict[str, list[float]]] = {}
+for qid in _human_ids:
+    cat_group = CATEGORY_GROUPS[_curated_data[qid]["category"]]
+    bucket = _human_by_cat.setdefault(cat_group, {"distinct_k": [], "utility_k": []})
+    bucket["distinct_k"].append(_human_data[qid]["distinct"])
+    bucket["utility_k"].append(_human_data[qid]["utility"])
+
+human_baselines = {
+    cat: {
+        "distinct_k": float(np.mean(v["distinct_k"])),
+        "utility_k": float(np.mean(v["utility_k"])),
+    }
+    for cat, v in _human_by_cat.items()
+}
+
 # %% Load model
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None:
@@ -58,173 +84,99 @@ model = AutoModelForCausalLM.from_pretrained(
 model.config.pad_token_id = tokenizer.pad_token_id
 
 
-# %% Generation helpers
-def _tokenize(prompts: list[str]):
-    tokenizer.padding_side = "left"
-    chat_texts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
+# %% Generate, score, and cache each method configuration
+def _finalize(results_df: pl.DataFrame, meta: dict) -> pl.DataFrame:
+    """Add category column, score, and cache.  No-op if already scored (cache hit)."""
+    if "distinct_k" in results_df.columns:
+        return results_df
+
+    results_df = results_df.with_columns(
+        pl.Series(
+            "category",
+            [QUESTION_CATEGORIES[pid] for pid in results_df["prompt_id"].to_list()],
         )
-        for p in prompts
-    ]
-    return tokenizer(chat_texts, return_tensors="pt", padding=True).to(model.device)
+    )
+    print("  Scoring ... ", end="", flush=True)
+    results_df = score_results(results_df, device="cuda:0")
+    save_results(results_df, meta, RESULTS_DIR)
+    return results_df
 
 
-@torch.no_grad()
-def generate_batched(prompts: list[str], **kwargs) -> list[str]:
-    """Generate one response per prompt, in BATCH_SIZE chunks. Returns decoded text."""
-    results = []
-    for i in range(0, len(prompts), BATCH_SIZE):
-        batch = prompts[i : i + BATCH_SIZE]
-        inputs = _tokenize(batch)
-        output_ids = model.generate(**inputs, **kwargs)
-        generated = output_ids[:, inputs["input_ids"].shape[1] :]
-        results.extend(
-            tokenizer.decode(generated[j], skip_special_tokens=True).strip()
-            for j in range(generated.shape[0])
+def _extract_metrics(results_df: pl.DataFrame, temperature: float) -> pl.DataFrame:
+    """Extract per-prompt metrics from a scored tidy DataFrame."""
+    return (
+        results_df.unique("prompt_id", maintain_order=True)
+        .select(
+            "prompt_id", "category", "distinct_k", "utility_k", "class_quality_mean"
         )
-    return results
+        .with_columns(pl.lit(temperature).alias("temperature"))
+    )
 
 
-def generate_responses(questions: list[str], n: int, **kwargs) -> list[list[str]]:
-    """Generate n responses per question. Returns Q × N list of decoded strings."""
-    flat = generate_batched([q for q in questions for _ in range(n)], **kwargs)
-    return [flat[q * n : (q + 1) * n] for q in range(len(questions))]
-
-
-# %% IFG (Intent Factored Generation) — Ahmed et al., 2025
-INTENT_INSTRUCTION = (
-    "Below is a prompt. Produce a brief direction for a response — "
-    "just 3-5 keywords or a single concept sentence. "
-    "Output ONLY the direction, nothing else.\n\n"
-    "Prompt: {question}\n\nDirection:"
+common = dict(
+    model_name=MODEL_NAME,
+    max_new_tokens=MAX_NEW_TOKENS,
+    batch_size=BATCH_SIZE,
+    results_dir=RESULTS_DIR,
 )
 
-IFG_RESPONSE_TEMPLATE = "{question}\n\n[Follow this direction: {intent}]"
+method_dfs: dict[str, list[pl.DataFrame]] = {
+    "Baseline": [],
+    f"IFG ($t_{{resp}}={T_RESPONSE_IFG}$)": [],
+    "Regeneration": [],
+}
 
-
-def generate_intents(questions: list[str], n: int, **kwargs) -> list[list[str]]:
-    """IFG Stage 1: sample N intent strings per question."""
-    flat = generate_batched(
-        [INTENT_INSTRUCTION.format(question=q) for q in questions for _ in range(n)],
-        max_new_tokens=48,
-        **kwargs,
-    )
-    return [flat[q * n : (q + 1) * n] for q in range(len(questions))]
-
-
-def generate_from_intents(
-    questions: list[str], intents: list[list[str]], **kwargs
-) -> list[list[str]]:
-    """IFG Stage 2: generate responses conditioned on (question, intent) pairs."""
-    Q, N_i = len(questions), len(intents[0])
-    flat = generate_batched(
-        [
-            IFG_RESPONSE_TEMPLATE.format(question=questions[q], intent=intents[q][n])
-            for q in range(Q)
-            for n in range(N_i)
-        ],
-        **kwargs,
-    )
-    return [flat[q * N_i : (q + 1) * N_i] for q in range(Q)]
-
-
-# %% Run experiments
-results_rows: list[dict] = []
-
-
-def _run_and_record(method: str, temperature: float, responses: list[list[str]]):
-    nb = compute_metrics(QUESTIONS, responses, device="cuda:0")
-    for q_idx in range(Q):
-        results_rows.append(
-            {
-                "method": method,
-                "temperature": temperature,
-                "prompt_id": QUESTION_IDS[q_idx],
-                "distinct_k": nb["distinct_k"][q_idx].item(),
-                "utility_k": nb["utility_k"][q_idx].item(),
-                "class_quality_mean": nb["class_quality_mean"][q_idx].item(),
-            }
-        )
-    dk = nb["distinct_k"].mean().item()
-    uk = nb["utility_k"].mean().item()
-    print(f"distinct_k={dk:.2f}/{N}  utility_k={uk:.2f}")
-
-
+print("\n--- Baseline ---")
 for temp in TEMPERATURES:
-    print(f"Baseline temp={temp:.2f} ... ", end="", flush=True)
-    responses = generate_responses(
+    results_df, meta = baseline.generate(
+        model, tokenizer, QUESTIONS, N, temperature=float(temp), **common
+    )
+    results_df = _finalize(results_df, meta)
+    method_dfs["Baseline"].append(_extract_metrics(results_df, float(temp)))
+
+print("\n--- IFG ---")
+ifg_label = f"IFG ($t_{{resp}}={T_RESPONSE_IFG}$)"
+for t_i in TEMPERATURES:
+    results_df, meta = ifg.generate(
+        model,
+        tokenizer,
         QUESTIONS,
         N,
-        max_new_tokens=MAX_NEW_TOKENS,
-        do_sample=True,
-        temperature=float(temp),
+        temperature_intent=float(t_i),
+        temperature_response=T_RESPONSE_IFG,
+        **common,
     )
-    _run_and_record("baseline", float(temp), responses)
+    results_df = _finalize(results_df, meta)
+    method_dfs[ifg_label].append(_extract_metrics(results_df, float(t_i)))
 
-# %%
-for t_i in TEMPERATURES:
-    print(f"IFG t_intent={t_i:.2f}, t_resp={T_RESPONSE_IFG} ... ", end="", flush=True)
-    intents = generate_intents(QUESTIONS, N, do_sample=True, temperature=float(t_i))
-    responses = generate_from_intents(
-        QUESTIONS,
-        intents,
-        max_new_tokens=MAX_NEW_TOKENS,
-        do_sample=True,
-        temperature=T_RESPONSE_IFG,
+print("\n--- Regeneration ---")
+for temp in TEMPERATURES:
+    results_df, meta = regeneration.generate(
+        model, tokenizer, QUESTIONS, N, temperature=float(temp), **common
     )
-    _run_and_record(f"ifg_t_resp={T_RESPONSE_IFG}", float(t_i), responses)
+    results_df = _finalize(results_df, meta)
+    method_dfs["Regeneration"].append(_extract_metrics(results_df, float(temp)))
 
-# %% Save results to timestamped CSV
-df = pl.DataFrame(results_rows)
+# %% Build per-method DataFrames and combined CSV
+methods_combined: dict[str, pl.DataFrame] = {
+    name: pl.concat(dfs) for name, dfs in method_dfs.items()
+}
+
+all_df = pl.concat(
+    df.with_columns(pl.lit(name).alias("method"))
+    for name, df in methods_combined.items()
+)
 csv_path = f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-df.write_csv(csv_path)
-print(f"Saved {len(df)} rows to {csv_path}")
-print(df)
-
+all_df.write_csv(csv_path)
+print(f"\nSaved {len(all_df)} rows to {csv_path}")
+print(all_df)
 
 # %% Plot
-def _summarize_for_plot(df: pl.DataFrame, method: str) -> dict:
-    s = (
-        df.filter(pl.col("method") == method)
-        .group_by("temperature")
-        .agg(
-            pl.col("distinct_k").mean().alias("distinct_k_mean"),
-            (pl.col("distinct_k").std() / pl.col("distinct_k").count().sqrt()).alias(
-                "distinct_k_sem"
-            ),
-            pl.col("utility_k").mean().alias("utility_k_mean"),
-            (pl.col("utility_k").std() / pl.col("utility_k").count().sqrt()).alias(
-                "utility_k_sem"
-            ),
-        )
-        .sort("temperature")
-    )
-    return {
-        "x": s["temperature"].to_numpy(),
-        "distinct_k_mean": s["distinct_k_mean"].to_numpy(),
-        "distinct_k_sem": s["distinct_k_sem"].to_numpy(),
-        "utility_k_mean": s["utility_k_mean"].to_numpy(),
-        "utility_k_sem": s["utility_k_sem"].to_numpy(),
-    }
-
-
-ifg_method = f"ifg_t_resp={T_RESPONSE_IFG}"
 fig = plot_metrics(
-    {
-        "Baseline": _summarize_for_plot(df, "baseline"),
-        f"IFG ($t_{{resp}}={T_RESPONSE_IFG}$)": _summarize_for_plot(df, ifg_method),
-    },
+    methods_combined,
     n=N,
-    human_distinct_k=float(human_distinct_k.mean()),
-    human_utility_k=float(human_utility_k.mean()),
-    xlabel="Temperature",
+    human_baselines=human_baselines,
     title=f"{MODEL_NAME}  ·  N={N}  ·  {Q} NB-Curated prompts  ·  ±1 SEM",
-    save_path="diversity_vs_temperature.png",
+    save_path=f"{RESULTS_DIR}/plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
 )
 plt.show()
-
-# %%

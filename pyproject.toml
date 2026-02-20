@@ -10,6 +10,7 @@ dependencies = [
     "inspect-evals[novelty-bench]>=0.3.106",
     "ipykernel>=7.2.0",
     "lovely-tensors>=0.1.21",
+    "nnsight>=0.5.15",
     "polars>=1.38.1",
     "python-dotenv>=1.2.1",
     "sentence-transformers>=5.2.3",
